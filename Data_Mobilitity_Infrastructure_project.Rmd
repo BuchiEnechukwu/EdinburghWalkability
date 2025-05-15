@@ -1,0 +1,594 @@
+---
+title: "Reproducible Notebook"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+# Data Collection
+## Load all required libraries for easy transitions
+```{r}
+library(osmdata)
+library(sf)
+library(tidyverse)
+library(stplanr)
+library(units)
+library(ggplot2)
+library(corrplot)
+library(tmap)
+library(ggcorrplot)
+library(osrm)
+
+```
+
+## Find the city boundary
+```{r}
+# open the wiki features page https://wiki.openstreetmap.org/wiki/Map_features on your browser to ensure seamless data collection.
+
+edi_bnd <- getbb("Edinburgh", format_out = "polygon")
+
+```
+
+My chosen variable are buildings, amenities, natural, highway intersections and office. This is supported by studies from Franke et al (2004), Frank et al., (2021) and Saelens et al., (2003)
+
+
+## Finding the buildings data
+```{r}
+
+edi_buildings <- opq (edi_bnd) %>%
+   add_osm_feature(key = "building", value = c("apartments","bungalow","dormitory","hotel","residential", "terrace", "commercial", "supermarket", "warehouse", "religious")) %>%
+   osmdata_sf() #this last line is to make the output a simple feature object
+ 
+ edi_buildings
+
+```
+
+
+## Load amenities data
+```{r}
+edi_amenities <- opq(edi_bnd) %>%
+  add_osm_feature(key = "amenity", value = c("cafe","fast_food", "post_office", "community_centre","casino","cinema","atm", "kindergarten", "clinic")) %>%
+  osmdata_sf()
+
+edi_amenities
+
+```
+
+
+## Load Natural environment data
+```{r}
+edi_natural <- opq(edi_bnd) %>%
+  add_osm_feature(key = "natural", value = c("scrub","tree","shrubbery","tree_row")) %>%
+  osmdata_sf()
+
+edi_natural
+```
+
+## Load Intersections: highway data
+
+```{r}
+edi_highway <- opq(edi_bnd) %>%
+  add_osm_feature(key = "highway", value = c("living_street", "crossing", "service","pedestrian","footway","residential","road")) %>%
+  osmdata_sf()
+
+edi_highway
+```
+
+
+## Load Office data
+```{r}
+edi_office <- opq(edi_bnd) %>%
+  add_osm_feature(key = "office") %>%
+  osmdata_sf()
+
+edi_office
+```
+
+
+
+
+
+# Data Preprocessing
+## Plot buildings as polygons
+```{r}
+ edi_buildings <- edi_buildings$osm_polygons #choice of polygon was for the area coverage
+ edi_buildings <- edi_buildings %>% select(osm_id)
+ 
+ plot(edi_buildings$geometry)
+```
+
+
+## Plot amenities as points
+```{r}
+edi_amenities <- edi_amenities$osm_points
+
+#select only the columns needed
+edi_amenities <- edi_amenities %>%
+  select(name, amenity)
+
+#remove NULL values
+edi_amenities <- edi_amenities %>%
+  filter(!is.na(amenity))
+
+plot(edi_amenities$geometry)
+
+```
+
+## Plot natural as points
+```{r}
+
+ edi_natural <- edi_natural$osm_points 
+ edi_natural <- edi_natural %>% select(osm_id)
+ 
+ plot(edi_natural$geometry)
+
+```
+
+
+
+## Plot Intersections as points: Plot highway as lines and remove null values
+
+```{r}
+
+#First remove all the null values with zero
+edi_highway <- edi_highway$osm_lines
+
+edi_highway <- edi_highway %>%
+  select(name, access)
+
+edi_highway <- edi_highway %>%
+  filter(!is.na(access)) #remove NULL values
+
+
+
+#break road network at intersecting lines
+rnet_vertices = rnet_breakup_vertices(edi_highway)
+ 
+boundaries = line2points(rnet_vertices) #extract point of intersection
+
+boundaries_df = as.data.frame(st_coordinates(boundaries)) #get points coordinates
+
+boundaries_n = dplyr::summarise(dplyr::group_by(boundaries_df, X, Y), n = dplyr::n()) #group by coordinates to find road segments sharing the same intersection
+
+junction_df = boundaries_n[boundaries_n$n >= 3, ] #Define junctions as points shared among more than 3 street segments
+
+edi_intersections = sf::st_as_sf(junction_df[,1:2], coords = c("X", "Y"), crs = sf::st_crs(edi_highway)) #transform a data frame into an sf object 
+
+
+
+#Plot of intersections as points
+
+plot(edi_intersections$geometry)
+```
+
+
+## Plot office as points
+```{r}
+edi_office <- edi_office$osm_points
+
+#select only the columns needed
+edi_office <- edi_office %>%
+  select(name, "addr:street")
+
+#remove NULL values
+edi_office <- edi_office %>%
+  filter(!is.na("addr:street"))
+
+plot(edi_office$geometry)
+```
+
+
+
+
+
+
+# Composite indicator
+## transform the indicator
+```{r}
+buildings <- st_transform(edi_buildings, 27700)
+amenities <- st_transform(edi_amenities, 27700)
+natural <- st_transform(edi_natural, 27700)
+intersections <- st_transform(edi_intersections, 27700)
+offices <- st_transform(edi_office, 27700)
+```
+
+## Create grid
+```{r}
+
+cell_area <- as_units(1, "km^2") # target grid size
+
+grid_spacing <- sqrt(2*cell_area/sqrt(3)) # size of hexagon calculated from area
+
+
+grid <- st_make_grid(buildings, cellsize = grid_spacing, what = "polygons", square = FALSE) %>% st_sf() 
+
+grid <- grid %>%
+  mutate(
+    gid = seq(1:nrow(grid))
+  )
+
+plot(grid$geometry)
+```
+
+## Building area count
+```{r}
+grid_buildings <- st_intersection(buildings, grid) # to ensure the shapes of buildings divided when crossed by a hexagon to be able to measure the building area falling within each hexagon cell 
+
+grid_buildings <- grid_buildings %>%
+  mutate(
+    bld_a = st_area(grid_buildings)
+  ) 
+grid_buildings <- grid_buildings %>%
+  st_drop_geometry() %>% #No need for the spatial referent anymore
+  group_by(gid) %>%
+  summarise(
+    bld_a = sum(bld_a)
+  )
+``` 
+
+
+
+## Intersection counts
+```{r}
+grid_intersections <- st_intersection(grid, intersections) %>% #duplicate the hexagon cells for every intersecting point
+  st_drop_geometry() %>% 
+  group_by(gid) %>% #group the hexagons by id to return to a grid with one row per id
+  summarise(
+    its_c = n() # count the number of rows that had the same gid
+  )  
+
+```
+
+
+
+## Amenities count
+```{r}
+grid_amenities <- st_intersection(grid, amenities) %>% # this duplicates the hexagon cells for every intersecting point
+  st_drop_geometry() %>% 
+  group_by(gid) %>% #this groups the hexagons by id to return to a grid with one row per id
+  summarise(
+    amt_c = n() #this counts the number of rows that had the same gid
+  ) 
+```
+
+
+## Natural counts
+```{r}
+grid_natural <- st_intersection(grid, natural) %>%
+  st_drop_geometry() %>% 
+  group_by(gid) %>% 
+  summarise(
+   ntn_c = n() 
+  ) 
+```
+
+### Office count
+```{r}
+grid_office <- st_intersection(grid, offices) %>% 
+  st_drop_geometry() %>% 
+  group_by(gid) %>% 
+  summarise(
+    off_c = n() #this counts the number of rows that had the same gid
+  ) 
+```
+
+
+
+
+
+# Exploratory Data Analysis
+## Histograms
+### Histogram of intersections
+```{r}
+#intersection count
+grid %>%
+  st_drop_geometry() %>%
+  ggplot(aes(x = its_c))+
+  geom_histogram(bins = 10)
+```
+
+### Histogram of buildings
+```{r}
+#building area
+
+grid %>%
+  ggplot(aes(x = bld_a))+
+  geom_histogram(bins = 10)
+```
+
+### Histogram of Amenities
+```{r}
+grid %>%
+  ggplot(aes(x = amt_c))+
+  geom_histogram(bins = 10)
+```
+
+
+### Histogram of Natural
+```{r}
+grid %>%
+  ggplot(aes(x = ntn_c))+
+  geom_histogram(bins = 10)
+
+```
+
+
+### Histogram of Offices
+```{r}
+grid %>%
+  ggplot(aes(x = off_c))+
+  geom_histogram(bins = 10)
+
+```
+
+
+
+## Correlation plot
+```{r}
+#first we need to compute the correlation matrix
+corr <- round(cor(st_drop_geometry(grid[,2:6])), 2) 
+corr
+
+#then we can compute the p-values - a correlation to be statistically significant needs to have a p-value < 0.001
+p.mat <- cor_pmat(st_drop_geometry(grid[,2:6]))
+p.mat
+
+#finally we can make the corrplot
+
+ggcorrplot(corr, hc.order = TRUE,
+    type = "lower", p.mat = p.mat)
+```
+
+
+## Mapping
+```{r}
+# I mapped the variables together
+tmap_mode("view")
+tm_shape(grid) +
+    tm_polygons(c("its_c", "bld_a", "amt_c", "ntn_c", "off_c"), alpha = 0.5, style = "equal") +
+    tm_facets(sync = TRUE, ncol = 5)
+```
+
+#Data Standardisation
+## Create a table of all the indicators, replace null values with zero and standardise the data
+```{r}
+
+#Create grid of all the indicators with join
+grid <- grid %>%
+  full_join(grid_intersections, by = c("gid" = "gid")) %>%
+  full_join(grid_buildings, by = c("gid" = "gid")) %>%
+  full_join(grid_amenities, by = c("gid" = "gid")) %>%
+  full_join(grid_natural, by = c("gid" = "gid")) %>%
+  full_join(grid_office, by = c("gid" = "gid"))
+
+#Replace null values with zero
+grid <- grid %>%
+  filter(!is.na(bld_a)) %>%
+  replace(is.na(.), 0)
+grid <- grid %>%
+  filter(!is.na(amt_c)) %>%
+  replace(is.na(.), 0)
+grid <- grid %>%
+  filter(!is.na(its_c)) %>%
+  replace(is.na(.), 0)
+grid <- grid %>%
+  filter(!is.na(ntn_c)) %>%
+  replace(is.na(.), 0)
+grid <- grid %>%
+  filter(!is.na(off_c)) %>%
+  replace(is.na(.), 0)
+
+view(grid)
+
+
+grid <- grid %>%
+  mutate( #the scale function returns a matrix while mutate wants a vector, which is why the scale function is within the as.vector function
+    its_c = as.vector(scale(its_c)),
+    bld_a = as.vector(scale(bld_a)),
+    amt_c = as.vector(scale(amt_c)),
+    ntn_c = as.vector(scale(ntn_c)),
+    off_c = as.vector(scale(off_c))
+  )
+
+
+summary(grid[,2:6]) #tranformed the mean to 0
+
+sapply(grid[2:6], sd) #transformed the standard deviation to 1
+
+```
+
+
+
+## Combine the indicators
+```{r}
+# I am giving priority to the amenities, nature and office
+walkability <- grid %>%
+  mutate(
+    walkability_0 = 4*amt_c + bld_a + its_c + 3*ntn_c + 2*off_c
+  ) #I prioritised amenities, natural and offices, by giving them more weights than building area and intersections.
+  
+```
+
+
+## Sensitivity Analysis
+```{r}
+#create different composite indicators with different weights
+walkability <- walkability %>%
+  mutate(
+    walkability_1 = 0.45*amt_c + bld_a + 0.32*its_c + 0.2*ntn_c + off_c,
+    walkability_2 = amt_c + bld_a + its_c + ntn_c + off_c
+  )
+
+#compute correlation between different composite indicators 
+
+walkability %>%
+  st_drop_geometry() %>%
+  select(starts_with("walkability")) %>%
+  cor()
+```
+
+## Visualisation
+```{r}
+
+tmap_mode("view")
+tm_shape(walkability) +
+    tm_fill("walkability_2", alpha = 0.5, palette = "viridis", midpoint = 0) #since there was not so much difference, I used the walkability_2, which had same weight for all the variables
+```
+
+
+
+
+#Service Analysis
+## Data collection
+```{r}
+
+#I listed services that could be accesses within 5, 10 and 15 minutes
+edi_services <- opq(edi_bnd) %>%
+  add_osm_feature(key = "amenity", value = c("cafe","fast_food", "exhibition_centre", "post_office", "community_centre","casino","cinema","atm", "kindergarten", "clinic")) %>%
+  osmdata_sf()
+
+edi_services <- edi_services$osm_points
+```
+
+
+## transform the grid (walkability to WGS84)
+```{r}
+grid <- walkability %>% st_transform(4326)
+amt <- edi_amenities %>% st_transform(4326)
+
+grid_centroids <- st_centroid(grid)
+plot(grid_centroids$geom)
+
+```
+
+
+
+
+# Site Selection
+```{r}
+
+tmap_mode("view")
+  tm_shape(grid_centroids) + tm_dots("walkability_2", alpha = 0.5, palette = "RdYlGn", midpoint = 0)
+  
+```
+
+## Check for the services available at the site with the highest walkability
+```{r}
+#I chose two sites that represents high and low walkability score
+
+site1 <- grid_centroids %>%
+  filter(gid == "353") #Site 353 is among the area with highest walkability scores
+
+
+site2 <- grid_centroids %>%
+  filter(gid == "422") # Site 422 is among the area on the map with lowest walkability scores
+
+```
+
+
+
+## isochrones
+```{r}
+
+iso <- osrmIsochrone(loc = site1, 
+                     breaks = c(5,10,15),
+                     osrm.profile = "foot") #Isochrone for the the high walkability site
+iso <- iso %>% st_make_valid() 
+
+
+tmap_mode("view")
+  tm_shape(site1) +
+    tm_dots(col = "red")+
+    tm_shape(iso) +
+    tm_polygons("isomax", alpha = 0.5, style = "cat") 
+
+```
+
+
+
+```{r}
+iso2 <- osrmIsochrone(loc = site2, 
+                     breaks = c(5,10,15),
+                     osrm.profile = "foot") #Isochrone for the low walkability site
+iso2 <- iso2 %>% st_make_valid() 
+
+
+tmap_mode("view")
+  tm_shape(site2) +
+    tm_dots(col = "red")+
+    tm_shape(iso2) +
+    tm_polygons("isomax", alpha = 0.5, style = "cat") 
+```
+
+
+### Service accessibility for for Site1 within 5, 10 and 15 minutes
+```{r}
+#intersect the edi_services with the isochrones
+#library(sf)
+services <- edi_services
+
+site_services <- st_intersection(iso, services) %>%
+  st_drop_geometry() %>% # spatial data is not necessary, hence I chose to summarise by grouping
+  group_by(id, amenity) %>%
+  summarise(
+    srv_c = n() # Count the number of the amenities that intersect with isochrones
+  )
+
+st_crs(iso)
+
+view(site_services)
+
+```
+
+### Service accessibility for for Site2 within 5, 10 and 15 minutes
+```{r}
+#intersect the edi_services with the isochrones
+#library(sf)
+services <- edi_services
+
+site_services2 <- st_intersection(iso2, services) %>%
+  st_drop_geometry() %>% # spatial data is not necessary, hence I chose to summarise by grouping
+  group_by(id, amenity) %>%
+  summarise(
+    srv_c = n() # Count the number of the amenities that intersect with isochrones
+  )
+
+st_crs(iso2)
+
+view(site_services2)
+
+```
+
+### Check the max and min in the dataset
+```{r}
+summary(site_services)
+```
+
+```{r}
+summary(site_services2)
+```
+
+### Map the result
+```{r}
+# ste the site_services as the sf class to be able to map
+site_services <- site_services %>%
+  pivot_wider(id_cols = "id", names_from = "amenity", values_from = "srv_c") %>%
+  inner_join(iso, by = c("id" = "id")) %>%
+  st_as_sf()
+
+tmap_mode("view")
+  tm_shape(site_services) + 
+    tm_fill(col = c("cafe","fast_food"), palette = "viridis", breaks = c(1, 20, 40, 60, 80, 100)) #set the breaks to be able to compare the maps between each other taking into consideration the count max and min 
+```
+
+
+```{r}
+# the site_services as the sf class to be able to map
+site_services2 <- site_services2 %>%
+  pivot_wider(id_cols = "id", names_from = "amenity", values_from = "srv_c") %>%
+  inner_join(iso2, by = c("id" = "id")) %>%
+  st_as_sf()
+
+tmap_mode("view")
+  tm_shape(site_services2) + 
+    tm_fill(col = c("cafe","fast_food"), palette = "viridis", breaks = c(1, 20, 40, 60, 80, 100)) #set the breaks to be able to compare the maps between each other taking into consideration the count max and min 
+```

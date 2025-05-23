@@ -1,8 +1,4 @@
----
-title: "Reproducible Notebook"
-output: html_document
-date: "`r Sys.Date()`"
----
+
 
 # Data Collection
 ## Load all required libraries for easy transitions
